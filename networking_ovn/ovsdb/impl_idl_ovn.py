@@ -583,3 +583,11 @@ class OvsdbSbOvnIdl(ovn_api.SbAPI):
         return (chassis.external_ids.get('datapath-type', ''),
                 chassis.external_ids.get('iface-types', ''),
                 self._get_chassis_physnets(chassis))
+
+    def get_ports_on_chassis(self, chassis):
+        ports = []
+        for port in self.idl.tables['Port_Binding'].rows.values():
+            if port.chassis and port.chassis[0].name == chassis:
+                ports.append(port)
+        return ports
+

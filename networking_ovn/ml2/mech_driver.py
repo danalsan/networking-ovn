@@ -33,6 +33,7 @@ from oslo_db import exception as os_db_exc
 from oslo_log import log
 
 from neutron.db import provisioning_blocks
+from neutron.plugins.common import utils as p_utils
 from neutron.services.qos import qos_consts
 from neutron.services.segments import db as segment_service_db
 
@@ -283,6 +284,13 @@ class OVNMechanismDriver(api.MechanismDriver):
         segid = self._get_attribute(network, pnet.SEGMENTATION_ID)
         self.create_network_in_ovn(network, {}, physnet, segid)
 
+        # Create a neutron port for DHCP/metadata services
+        port = {'port':
+                {'network_id': network['id'],
+                 'tenant_id': '',
+                 'device_owner': const.DEVICE_OWNER_DHCP}}
+        p_utils.create_port(self._plugin, n_context.get_admin_context(), port)
+
     def create_network_in_ovn(self, network, ext_ids,
                               physnet=None, segid=None):
         # Create a logical switch with a name equal to the Neutron network
@@ -364,11 +372,65 @@ class OVNMechanismDriver(api.MechanismDriver):
             utils.ovn_name(network['id']), if_exists=True).execute(
                 check_error=True)
 
+    def _find_metadata_port(self, context, network_id):
+         ports = self._plugin.get_ports(
+            context._plugin_context, filters=dict(
+                network_id=[network_id], device_owner=['network:dhcp']))
+         # TODO(dalvarez): Raise exception if more than 1 port is found
+         if len(ports) == 1:
+            return ports[0]
+
+    def update_metadata_port(self, context, network_id):
+        """Update metadata port.
+
+        This function will allocate an IP address for the metadata port of
+        the given network in all its subnets.
+        """
+        # Retrieve all subnets in this network
+        subnets = self._plugin.get_subnets(
+            context._plugin_context, filters=dict(
+                network_id=[network_id], ip_version=[4]))
+        # Retrieve the metadata port of this network
+        metadata_port = self._find_metadata_port(context, network_id)
+
+        subnet_ids = set(s['id'] for s in subnets)
+        port_subnet_ids = set(ip['subnet_id'] for ip in
+                              metadata_port['fixed_ips'])
+
+        # Find all subnets where metadata port doesn't have an IP in and
+        # allocate one.
+        if subnet_ids != port_subnet_ids:
+            wanted_fixed_ips = []
+            for fixed_ip in metadata_port['fixed_ips']:
+                wanted_fixed_ips.append(
+                    {'subnet_id': fixed_ip['subnet_id'],
+                     'ip_address': fixed_ip['ip_address']})
+        wanted_fixed_ips.extend(
+            dict(subnet_id=s)
+            for s in subnet_ids - port_subnet_ids)
+
+        port = {'id': metadata_port['id'],
+                'port': {'network_id': network_id,
+                         'fixed_ips': wanted_fixed_ips}}
+        self._plugin.update_port(n_context.get_admin_context(),
+                                 metadata_port['id'], port)
+
+    def _find_metadata_port_ip(self, context, subnet):
+        metadata_port = self._find_metadata_port(context, subnet['network_id'])
+        if metadata_port:
+            for fixed_ip in metadata_port['fixed_ips']:
+                if fixed_ip['subnet_id'] == subnet['id']:
+                    return fixed_ip['ip_address']
+
     def create_subnet_postcommit(self, context):
         subnet = context.current
+        network = context.network.current
+        if subnet['ip_version'] == 4:
+            self.update_metadata_port(context, network['id'])
         if subnet['enable_dhcp']:
-            self.add_subnet_dhcp_options_in_ovn(subnet,
-                                                context.network.current)
+            metadata_port_ip = self._find_metadata_port_ip(context, subnet)
+            self.add_subnet_dhcp_options_in_ovn(
+                subnet, network, metadata_port_ip=metadata_port_ip)
 
     def update_subnet_postcommit(self, context):
         subnet = context.current
@@ -386,7 +448,8 @@ class OVNMechanismDriver(api.MechanismDriver):
                     subnet_dhcp_options['uuid']))
 
     def add_subnet_dhcp_options_in_ovn(self, subnet, network,
-                                       ovn_dhcp_options=None):
+                                       ovn_dhcp_options=None,
+                                       metadata_port_ip=None):
         # Don't insert DHCP_Options entry for v6 subnet with 'SLAAC' as
         # 'ipv6_address_mode', since DHCPv6 shouldn't work for this mode.
         if (subnet['ip_version'] == const.IP_VERSION_6 and
@@ -394,7 +457,8 @@ class OVNMechanismDriver(api.MechanismDriver):
             return
 
         if not ovn_dhcp_options:
-            ovn_dhcp_options = self.get_ovn_dhcp_options(subnet, network)
+            ovn_dhcp_options = self.get_ovn_dhcp_options(
+                subnet, network, metadata_port_ip=metadata_port_ip)
 
         txn_commands = self._nb_ovn.compose_dhcp_options_commands(
             subnet['id'], **ovn_dhcp_options)
@@ -402,7 +466,8 @@ class OVNMechanismDriver(api.MechanismDriver):
             for cmd in txn_commands:
                 txn.add(cmd)
 
-    def get_ovn_dhcp_options(self, subnet, network, server_mac=None):
+    def get_ovn_dhcp_options(self, subnet, network, server_mac=None,
+                             metadata_port_ip=None):
         external_ids = {'subnet_id': subnet['id']}
         dhcp_options = {'cidr': subnet['cidr'], 'options': {},
                         'external_ids': external_ids}
@@ -410,14 +475,16 @@ class OVNMechanismDriver(api.MechanismDriver):
         if subnet['enable_dhcp']:
             if subnet['ip_version'] == const.IP_VERSION_4:
                 dhcp_options['options'] = self._get_ovn_dhcpv4_opts(
-                    subnet, network, server_mac=server_mac)
+                    subnet, network, server_mac=server_mac,
+                    metadata_port_ip=metadata_port_ip)
             else:
                 dhcp_options['options'] = self._get_ovn_dhcpv6_opts(
                     subnet, server_id=server_mac)
 
         return dhcp_options
 
-    def _get_ovn_dhcpv4_opts(self, subnet, network, server_mac=None):
+    def _get_ovn_dhcpv4_opts(self, subnet, network, server_mac=None,
+                             metadata_port_ip=None):
         if not subnet['gateway_ip']:
             return {}
 
@@ -443,6 +510,10 @@ class OVNMechanismDriver(api.MechanismDriver):
         # If subnet hostroutes are defined, add them in the
         # 'classless_static_route' dhcp option
         classless_static_routes = "{"
+        if metadata_port_ip:
+            classless_static_routes += ("169.254.169.254/32,%s, ") % (
+                metadata_port_ip)
+
         for route in subnet['host_routes']:
             classless_static_routes += ("%s,%s, ") % (
                 route['destination'], route['nexthop'])
@@ -657,7 +728,8 @@ class OVNMechanismDriver(api.MechanismDriver):
             for ip in port.get('fixed_ips', []):
                 addresses += ' ' + ip['ip_address']
             port_security = self._get_allowed_addresses_from_port(port)
-            port_type = ''
+            port_type = ovn_const.OVN_NEUTRON_OWNER_TO_PORT_TYPE.get(
+                port['device_owner'], '')
 
         dhcpv4_options = self.get_port_dhcp_options(port, const.IP_VERSION_4)
         dhcpv6_options = self.get_port_dhcp_options(port, const.IP_VERSION_6)
@@ -666,7 +738,9 @@ class OVNMechanismDriver(api.MechanismDriver):
                            parent_name, tag, dhcpv4_options, dhcpv6_options)
 
     def create_port_in_ovn(self, port, ovn_port_info):
-        external_ids = {ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name']}
+        external_ids = {ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name'],
+                        ovn_const.OVN_DEVID_EXT_ID_KEY: port['device_id'],
+                        ovn_const.OVN_PROJID_EXT_ID_KEY: port['project_id']}
         lswitch_name = utils.ovn_name(port['network_id'])
         admin_context = n_context.get_admin_context()
         sg_cache = {}
@@ -778,8 +852,10 @@ class OVNMechanismDriver(api.MechanismDriver):
         self._update_port_in_ovn(original_port, port, ovn_port_info)
 
     def _update_port_in_ovn(self, original_port, port, ovn_port_info):
-        external_ids = {
-            ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name']}
+        external_ids = {ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name'],
+                        ovn_const.OVN_DEVID_EXT_ID_KEY: port['device_id'],
+                        ovn_const.OVN_PROJID_EXT_ID_KEY: port['project_id']}
+
         admin_context = n_context.get_admin_context()
         sg_cache = {}
         subnet_cache = {}
