@@ -56,7 +56,8 @@ OvnPortInfo = collections.namedtuple('OvnPortInfo', ['type', 'options',
                                                      'port_security',
                                                      'parent_name', 'tag',
                                                      'dhcpv4_options',
-                                                     'dhcpv6_options'])
+                                                     'dhcpv6_options',
+                                                     'cidrs'])
 
 
 class OVNMechanismDriver(api.MechanismDriver):
@@ -384,7 +385,7 @@ class OVNMechanismDriver(api.MechanismDriver):
         """Update metadata port.
 
         This function will allocate an IP address for the metadata port of
-        the given network in all its subnets.
+        the given network in all its IPv4 subnets.
         """
         # Retrieve all subnets in this network
         subnets = self._plugin.get_subnets(
@@ -405,15 +406,15 @@ class OVNMechanismDriver(api.MechanismDriver):
                 wanted_fixed_ips.append(
                     {'subnet_id': fixed_ip['subnet_id'],
                      'ip_address': fixed_ip['ip_address']})
-        wanted_fixed_ips.extend(
-            dict(subnet_id=s)
-            for s in subnet_ids - port_subnet_ids)
+            wanted_fixed_ips.extend(
+                dict(subnet_id=s)
+                for s in subnet_ids - port_subnet_ids)
 
-        port = {'id': metadata_port['id'],
-                'port': {'network_id': network_id,
-                         'fixed_ips': wanted_fixed_ips}}
-        self._plugin.update_port(n_context.get_admin_context(),
-                                 metadata_port['id'], port)
+            port = {'id': metadata_port['id'],
+                    'port': {'network_id': network_id,
+                             'fixed_ips': wanted_fixed_ips}}
+            self._plugin.update_port(n_context.get_admin_context(),
+                                     metadata_port['id'], port)
 
     def _find_metadata_port_ip(self, context, subnet):
         metadata_port = self._find_metadata_port(context, subnet['network_id'])
@@ -434,9 +435,13 @@ class OVNMechanismDriver(api.MechanismDriver):
 
     def update_subnet_postcommit(self, context):
         subnet = context.current
+        network = context.network.current
+        if subnet['ip_version'] == 4 or context.original['ip_version'] == 4:
+            self.update_metadata_port(context, network['id'])
         if subnet['enable_dhcp'] or context.original['enable_dhcp']:
-            self.add_subnet_dhcp_options_in_ovn(subnet,
-                                                context.network.current)
+            metadata_port_ip = self._find_metadata_port_ip(context, subnet)
+            self.add_subnet_dhcp_options_in_ovn(
+                subnet, network, metadata_port_ip=metadata_port_ip)
 
     def delete_subnet_postcommit(self, context):
         subnet = context.current
@@ -711,6 +716,7 @@ class OVNMechanismDriver(api.MechanismDriver):
             qos_options = self.qos_driver.get_qos_options(port)
         vtep_physical_switch = binding_profile.get('vtep-physical-switch')
 
+        cidrs = ''
         if vtep_physical_switch:
             vtep_logical_switch = binding_profile.get('vtep-logical-switch')
             port_type = 'vtep'
@@ -727,6 +733,10 @@ class OVNMechanismDriver(api.MechanismDriver):
             addresses = port['mac_address']
             for ip in port.get('fixed_ips', []):
                 addresses += ' ' + ip['ip_address']
+                subnet = self._plugin.get_subnet(n_context.get_admin_context(),
+                                                 ip['subnet_id'])
+                cidrs += ' {}/{}'.format(ip['ip_address'],
+                                         subnet['cidr'].split('/')[1])
             port_security = self._get_allowed_addresses_from_port(port)
             port_type = ovn_const.OVN_NEUTRON_OWNER_TO_PORT_TYPE.get(
                 port['device_owner'], '')
@@ -735,12 +745,14 @@ class OVNMechanismDriver(api.MechanismDriver):
         dhcpv6_options = self.get_port_dhcp_options(port, const.IP_VERSION_6)
 
         return OvnPortInfo(port_type, options, [addresses], port_security,
-                           parent_name, tag, dhcpv4_options, dhcpv6_options)
+                           parent_name, tag, dhcpv4_options, dhcpv6_options,
+                           cidrs.strip())
 
     def create_port_in_ovn(self, port, ovn_port_info):
         external_ids = {ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name'],
                         ovn_const.OVN_DEVID_EXT_ID_KEY: port['device_id'],
-                        ovn_const.OVN_PROJID_EXT_ID_KEY: port['project_id']}
+                        ovn_const.OVN_PROJID_EXT_ID_KEY: port['project_id'],
+                        ovn_const.OVN_CIDRS_EXT_ID_KEY: ovn_port_info.cidrs}
         lswitch_name = utils.ovn_name(port['network_id'])
         admin_context = n_context.get_admin_context()
         sg_cache = {}
@@ -854,7 +866,8 @@ class OVNMechanismDriver(api.MechanismDriver):
     def _update_port_in_ovn(self, original_port, port, ovn_port_info):
         external_ids = {ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name'],
                         ovn_const.OVN_DEVID_EXT_ID_KEY: port['device_id'],
-                        ovn_const.OVN_PROJID_EXT_ID_KEY: port['project_id']}
+                        ovn_const.OVN_PROJID_EXT_ID_KEY: port['project_id'],
+                        ovn_const.OVN_CIDRS_EXT_ID_KEY: ovn_port_info.cidrs}
 
         admin_context = n_context.get_admin_context()
         sg_cache = {}

@@ -36,7 +36,10 @@ SHARED_OPTS = [
                default='',
                help=_("Group (gid or name) running metadata proxy after "
                       "its initialization (if empty: agent effective "
-                      "group)."))
+                      "group).")),
+    cfg.StrOpt('ovs_integration_bridge',
+               default='br-int',
+               help=_('Name of Open vSwitch bridge to use'))
 ]
 
 

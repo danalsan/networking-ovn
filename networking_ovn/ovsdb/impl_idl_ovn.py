@@ -546,6 +546,12 @@ class OvsdbSbOvnIdl(ovn_api.SbAPI):
             LOG.exception(connection_exception)
             raise connection_exception
 
+    def transaction(self, check_error=False, log_errors=True, **kwargs):
+        return idl_trans.Transaction(self,
+                                     OvsdbSbOvnIdl.ovsdb_connection,
+                                     self.ovsdb_timeout,
+                                     check_error, log_errors)
+
     def _get_chassis_physnets(self, chassis):
         bridge_mappings = chassis.external_ids.get('ovn-bridge-mappings', '')
         mapping_dict = helpers.parse_mappings(bridge_mappings.split(','),
@@ -583,6 +589,34 @@ class OvsdbSbOvnIdl(ovn_api.SbAPI):
         return (chassis.external_ids.get('datapath-type', ''),
                 chassis.external_ids.get('iface-types', ''),
                 self._get_chassis_physnets(chassis))
+
+    def get_metadata_port_network(self, network):
+        for port in self.idl.tables['Port_Binding'].rows.values():
+            if str(port.datapath.uuid) == network and port.type == 'localport':
+                return port
+
+    def get_chassis_metadata_networks(self, chassis):
+        """Return a list with the metadata networks the chassis is hosting.
+        """
+        try:
+            chassis = idlutils.row_by_value(self.idl, 'Chassis',
+                                            'name', chassis)
+        except idlutils.RowNotFound:
+            msg = _('Chassis %s does not exist') % chassis
+            raise RuntimeError(msg)
+        proxy_networks = chassis.external_ids.get(
+            'neutron-metadata-proxy-networks', None)
+        return proxy_networks.split(',') if proxy_networks else []
+
+    def set_chassis_metadata_networks(self, chassis, networks):
+        nets = ','.join(networks) if networks else ''
+        return cmd.UpdateChassisExtIdsCommand(
+            self, chassis, {'neutron-metadata-proxy-networks': nets},
+            if_exists=True)
+
+    def set_port_cidrs(self, name, cidrs):
+        return cmd.UpdatePortExtIdsCommand(
+            self, name, {'neutron-port-cidrs': cidrs}, if_exists=True)
 
     def get_ports_on_chassis(self, chassis):
         ports = []

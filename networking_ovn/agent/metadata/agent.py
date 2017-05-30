@@ -26,15 +26,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import eventlet
+import re
 
+from neutron.agent.common import ovs_lib
 from neutron.agent.common import utils
+from neutron.agent.linux import ip_lib
+from neutron_lib import constants as n_const
 from oslo_log import log
 from ovs.stream import Stream
 from ovsdbapp.backend.ovs_idl import connection
 from ovsdbapp.backend.ovs_idl import idlutils
 
 from networking_ovn.common import config
+from networking_ovn.common import constants as ovn_const
 from networking_ovn.agent.metadata import server
 from networking_ovn.ovsdb import impl_idl_ovn as idl_ovn
 from networking_ovn.ovsdb import ovsdb_monitor
@@ -44,7 +50,17 @@ from networking_ovn.ovsdb import vlog
 
 LOG = log.getLogger(__name__)
 NS_PREFIX = 'qmeta-'
+METADATA_DEFAULT_PREFIX = 16
+METADATA_DEFAULT_IP = '169.254.169.254'
+METADATA_DEFAULT_CIDR = '%s/%d' % (METADATA_DEFAULT_IP,
+                                   METADATA_DEFAULT_PREFIX)
+METADATA_PORT = 80
+MAC_PATTERN = re.compile(r'([0-9A-F]{2}[:-]){5}([0-9A-F]{2})', re.I)
+IPV4_PATTERN = re.compile(
+    r'((2[0-5]|1[0-9]|[0-9])?[0-9]\.){3}((2[0-5]|1[0-9]|[0-9])?[0-9])')
 
+MetadataPortInfo = collections.namedtuple('MetadataPortInfo', ['mac',
+                                                               'ip_addresses'])
 
 class OvnNbIdl(ovsdb_monitor.OvnIdl):
     def __init__(self, driver, remote, schema):
@@ -72,9 +88,6 @@ class OvnSbIdl(ovsdb_monitor.OvnIdl):
     def from_server(cls, connection_string, schema_name, chassis):
         _check_and_set_ssl_files(schema_name)
         helper = idlutils.get_schema_helper(connection_string, schema_name)
-        #helper.register_table('Port_Binding')
-        #helper.register_table('Chassis')
-        #helper.register_table('Datapath')
         helper.register_all()
         _idl = cls(connection_string, helper, chassis)
         _idl.set_lock(_idl.event_lock_name)
@@ -93,7 +106,7 @@ class PortBindingChassisEvent(row_event.RowEvent):
     def run(self, event, row, old):
         if len(row.chassis) and row.chassis[0].name == self.chassis:
             print("Port bound to our chassis")
-        elif len(old.chassis)  and old.chassis[0].name == self.chassis:
+        elif len(old.chassis) and old.chassis[0].name == self.chassis:
             print("Port unbound to our chassis")
         print len(row.chassis)
 
@@ -146,7 +159,6 @@ class MetadataAgent(object):
         self.idl_nb_conn.start()
         self.idl_sb_conn.start()
 
-        import pdb; pdb.set_trace()
         self.ensure_all_networks_provisioned()
 
         # Launch the server that will act as a proxy between the VM's and Nova.
@@ -156,10 +168,89 @@ class MetadataAgent(object):
     def sync():
         pass
 
+    @staticmethod
+    def _get_veth_name(datapath):
+        return ['{}{}{}'.format(n_const.TAP_DEVICE_PREFIX,
+                                 datapath[:10], i) for i in [0, 1]]
+
     def ensure_all_networks_provisioned(self):
+        # 1. Retrieve all datapaths where we have ports bound in our chassis
+        # 2. For every datapath make sure that:
+        #   2.1 The namespace is created
+        #   2.2 The VETH pair is created
+        #   2.3 An OVS port exists with the right external-id:iface-id
+        #   2.4 metadata proxy is running
+        #   2.5 It's added to the Chassis column externa-id
         idl = idl_ovn.OvsdbSbOvnIdl(self.idl_sb_conn)
+
+        # 1. Retrieve all ports in our Chassis with type == ''
         ports = idl.get_ports_on_chassis(self.chassis)
-        datapaths = {str(p.datapath.uuid)  for p in ports if p.type == ''}
+        datapaths = {str(p.datapath.uuid) for p in ports if p.type == ''}
+        for datapath in datapaths:
+            port = idl.get_metadata_port_network(datapath)
+            # If there's no metadata port, it has no MAC address or no IP's,
+            # then skip this datapath.
+            # TODO(dalvarez): Tear down the namespace if exists when skipping
+            # a datapath.
+            if not (port and port.mac and
+                    port.external_ids.get(ovn_const.OVN_CIDRS_EXT_ID_KEY,
+                                          None)):
+                continue
+
+            # First entry of the mac field must be the MAC address
+            match = MAC_PATTERN.match(port.mac[0].split(' ')[0])
+            if not match:
+                continue
+
+            mac = match.group()
+            ip_addresses = set(
+                port.external_ids[ovn_const.OVN_CIDRS_EXT_ID_KEY].split(' '))
+            ip_addresses.add(METADATA_DEFAULT_CIDR)
+            metadata_port = MetadataPortInfo(mac, ip_addresses)
+
+            # 2.1 Make sure that the namespace is created
+            # 2.2 Make sure that the VETH pair exists
+            namespace = NS_PREFIX + datapath
+            #ip_lib.IPWrapper().ensure_namespace(namespace)
+            veth_name = self._get_veth_name(datapath)
+
+            if ip_lib.device_exists(veth_name[1], namespace):
+                ip2 = ip_lib.IPDevice(veth_name[1], namespace)
+            else:
+                ip1, ip2 = ip_lib.IPWrapper().add_veth(
+                    veth_name[0], veth_name[1], namespace)
+                ip1.link.set_up()
+                ip2.link.set_up()
+
+            # Configure the MAC and IP addresses
+            ip2.link.set_address(metadata_port.mac)
+            dev_info = ip2.addr.list()
+
+            # Configure the IP addresses on the VETH pair and remove those
+            # that we no longer need.
+            current_cidrs = {dev['cidr'] for dev in dev_info}
+            for ipaddr in current_cidrs - metadata_port.ip_addresses:
+                ip2.addr.delete(ipaddr)
+            for ipaddr in metadata_port.ip_addresses - current_cidrs:
+                ip2.addr.add(ipaddr)
+
+            # Configure the OVS port and add external_ids:iface-id so that it
+            # can be tracked by OVN.
+            # TODO(dalvarez): pick integration bridge name from conf
+            ovs_br = ovs_lib.OVSBridge('br-int')
+            ovs_br.add_port(veth_name[0])
+            ovs_br.set_db_attribute('Interface', veth_name[0], 'external_ids',
+                                    {'iface-id': port.logical_port})
+
+        #ip1.link.set_address(
+        current_dps = idl.get_chassis_metadata_networks(self.chassis)
+        #with self._nb_ovn.transaction(check_error=True) as txn:
+        if datapaths != current_dps:
+            with idl.transaction(check_error=True) as txn:
+                txn.add(idl.set_chassis_metadata_networks(
+                    self.chassis, datapaths))
+        #  datapaths - set(current_dps)
+        print current_dps
         print datapaths
 
 
