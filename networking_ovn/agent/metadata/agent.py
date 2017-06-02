@@ -32,6 +32,7 @@ import re
 
 from neutron.agent.common import ovs_lib
 from neutron.agent.common import utils
+from neutron.agent.linux import external_process
 from neutron.agent.linux import ip_lib
 from neutron_lib import constants as n_const
 from oslo_log import log
@@ -41,6 +42,7 @@ from ovsdbapp.backend.ovs_idl import idlutils
 
 from networking_ovn.common import config
 from networking_ovn.common import constants as ovn_const
+from networking_ovn.agent.metadata import driver as metadata_driver
 from networking_ovn.agent.metadata import server
 from networking_ovn.ovsdb import impl_idl_ovn as idl_ovn
 from networking_ovn.ovsdb import ovsdb_monitor
@@ -49,6 +51,7 @@ from networking_ovn.ovsdb import vlog
 
 
 LOG = log.getLogger(__name__)
+
 NS_PREFIX = 'qmeta-'
 METADATA_DEFAULT_PREFIX = 16
 METADATA_DEFAULT_IP = '169.254.169.254'
@@ -56,8 +59,6 @@ METADATA_DEFAULT_CIDR = '%s/%d' % (METADATA_DEFAULT_IP,
                                    METADATA_DEFAULT_PREFIX)
 METADATA_PORT = 80
 MAC_PATTERN = re.compile(r'([0-9A-F]{2}[:-]){5}([0-9A-F]{2})', re.I)
-IPV4_PATTERN = re.compile(
-    r'((2[0-5]|1[0-9]|[0-9])?[0-9]\.){3}((2[0-5]|1[0-9]|[0-9])?[0-9])')
 
 MetadataPortInfo = collections.namedtuple('MetadataPortInfo', ['mac',
                                                                'ip_addresses'])
@@ -132,16 +133,22 @@ def _check_and_set_ssl_files(schema_name):
 
 
 def _get_own_chassis_name():
-    cmd = 'ovs-vsctl get open . external_ids:system-id'
-    return utils.execute(cmd.split(),
-                         run_as_root=True).strip().replace('"', '')
+    """Return the external_ids:system-id value of the Open_vSwitch table.
 
+    As long as ovn-controller is running on this node, the key is guaranteed
+    to exist and will include the chassis name.
+    """
+    ext_ids = ovs_lib.BaseOVS().db_get_val('Open_vSwitch', '.', 'external_ids')
+    return ext_ids['system-id']
 
 class MetadataAgent(object):
 
     def __init__(self, conf):
         self.conf = conf
         vlog.use_oslo_logger()
+        self._process_monitor = external_process.ProcessMonitor(
+            config=self.conf,
+            resource_type='metadata')
 
     def start(self):
         idl_nb = OvnNbIdl.from_server(config.get_ovn_nb_connection(),
@@ -162,7 +169,7 @@ class MetadataAgent(object):
         self.ensure_all_networks_provisioned()
 
         # Launch the server that will act as a proxy between the VM's and Nova.
-        proxy = server.UnixDomainMetadataProxy(self.conf)
+        proxy = server.UnixDomainMetadataProxy(self.conf, self.idl_sb_conn)
         proxy.run()
 
     def sync():
@@ -242,6 +249,12 @@ class MetadataAgent(object):
             ovs_br.set_db_attribute('Interface', veth_name[0], 'external_ids',
                                     {'iface-id': port.logical_port})
 
+            import pdb; pdb.set_trace()
+            # Spawn metadata proxy
+            metadata_driver.MetadataDriver.spawn_monitored_metadata_proxy(
+                self._process_monitor, namespace, METADATA_PORT,
+                self.conf, network_id=str(port.datapath.uuid))
+
         #ip1.link.set_address(
         current_dps = idl.get_chassis_metadata_networks(self.chassis)
         #with self._nb_ovn.transaction(check_error=True) as txn:
@@ -260,6 +273,8 @@ if __name__ == '__mainX__':
     idl_nb_conn = connection.Connection(idl_nb, timeout=180)
     idl_nb_conn.start()
 
+    ovs = ovs_lib.BaseOVS()
+    ovs.db_get_val('open', '.', 'external_ids', 'system-id')
     cmd = 'ovs-vsctl get open . external_ids:system-id'
     chassis = utils.execute(cmd.split(),
                             run_as_root=True).strip().replace('"', '')

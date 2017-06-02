@@ -192,8 +192,9 @@ class MetadataProxyHandler(object):
 
 class UnixDomainMetadataProxy(object):
 
-    def __init__(self, conf):
+    def __init__(self, conf, sb_conn):
         self.conf = conf
+        self.sb_conn = sb_conn
         agent_utils.ensure_directory_exists_without_file(
             cfg.CONF.metadata_proxy_socket)
 
