@@ -151,10 +151,6 @@ class MetadataAgent(object):
             resource_type='metadata')
 
     def start(self):
-        idl_nb = OvnNbIdl.from_server(config.get_ovn_nb_connection(),
-                                      'OVN_Northbound', None)
-        self.idl_nb_conn = connection.Connection(
-            idl_nb, timeout=config.get_ovn_ovsdb_timeout())
 
         self.chassis = _get_own_chassis_name()
         idl_sb = OvnSbIdl.from_server(config.get_ovn_sb_connection(),
@@ -162,14 +158,14 @@ class MetadataAgent(object):
         self.idl_sb_conn = connection.Connection(
             idl_sb, timeout=config.get_ovn_ovsdb_timeout())
 
-        # Open the connection to both OVN NB and SB databases.
-        self.idl_nb_conn.start()
+        # Open the connection to OVN SB database.
         self.idl_sb_conn.start()
+        self.sb_idl = idl_ovn.OvsdbSbOvnIdl(self.idl_sb_conn)
 
         self.ensure_all_networks_provisioned()
 
         # Launch the server that will act as a proxy between the VM's and Nova.
-        proxy = server.UnixDomainMetadataProxy(self.conf, self.idl_sb_conn)
+        proxy = server.UnixDomainMetadataProxy(self.conf, self.sb_idl)
         proxy.run()
 
     def sync():
@@ -188,13 +184,12 @@ class MetadataAgent(object):
         #   2.3 An OVS port exists with the right external-id:iface-id
         #   2.4 metadata proxy is running
         #   2.5 It's added to the Chassis column externa-id
-        idl = idl_ovn.OvsdbSbOvnIdl(self.idl_sb_conn)
 
         # 1. Retrieve all ports in our Chassis with type == ''
-        ports = idl.get_ports_on_chassis(self.chassis)
+        ports = self.sb_idl.get_ports_on_chassis(self.chassis)
         datapaths = {str(p.datapath.uuid) for p in ports if p.type == ''}
         for datapath in datapaths:
-            port = idl.get_metadata_port_network(datapath)
+            port = self.sb_idl.get_metadata_port_network(datapath)
             # If there's no metadata port, it has no MAC address or no IP's,
             # then skip this datapath.
             # TODO(dalvarez): Tear down the namespace if exists when skipping
@@ -249,18 +244,17 @@ class MetadataAgent(object):
             ovs_br.set_db_attribute('Interface', veth_name[0], 'external_ids',
                                     {'iface-id': port.logical_port})
 
-            import pdb; pdb.set_trace()
             # Spawn metadata proxy
             metadata_driver.MetadataDriver.spawn_monitored_metadata_proxy(
                 self._process_monitor, namespace, METADATA_PORT,
                 self.conf, network_id=str(port.datapath.uuid))
 
         #ip1.link.set_address(
-        current_dps = idl.get_chassis_metadata_networks(self.chassis)
+        current_dps = self.sb_idl.get_chassis_metadata_networks(self.chassis)
         #with self._nb_ovn.transaction(check_error=True) as txn:
         if datapaths != current_dps:
-            with idl.transaction(check_error=True) as txn:
-                txn.add(idl.set_chassis_metadata_networks(
+            with self.sb_idl.transaction(check_error=True) as txn:
+                txn.add(self.sb_idl.set_chassis_metadata_networks(
                     self.chassis, datapaths))
         #  datapaths - set(current_dps)
         print current_dps

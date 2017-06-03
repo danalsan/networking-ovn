@@ -614,6 +614,14 @@ class OvsdbSbOvnIdl(ovn_api.SbAPI):
             self, chassis, {'neutron-metadata-proxy-networks': nets},
             if_exists=True)
 
+    def get_network_ports_by_ip(self, network, ip_address):
+        port_list = []
+        for port in self.idl.tables['Port_Binding'].rows.values():
+            if (port.mac and str(port.datapath.uuid) == network and
+                ip_address in port.mac[0].split(' ')):
+                port_list.append(port)
+        return port_list
+
     def set_port_cidrs(self, name, cidrs):
         return cmd.UpdatePortExtIdsCommand(
             self, name, {'neutron-port-cidrs': cidrs}, if_exists=True)
