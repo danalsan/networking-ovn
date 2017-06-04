@@ -11,12 +11,10 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
 import sys
 
 from neutron.common import cache_utils as cache
 from neutron.common import config
-from neutron.common import eventlet_utils
 from neutron.common import utils
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -32,14 +30,9 @@ def main():
     meta.register_meta_conf_opts(meta.UNIX_DOMAIN_METADATA_PROXY_OPTS)
     meta.register_meta_conf_opts(meta.METADATA_PROXY_HANDLER_OPTS)
     cache.register_oslo_configs(cfg.CONF)
-    cfg.CONF.set_default(name='cache_url', default='memory://?default_ttl=5')
     config.init(sys.argv[1:])
     config.setup_logging()
     utils.log_opt_values(LOG)
 
     agt = agent.MetadataAgent(cfg.CONF)
     agt.start()
-
-if __name__ == '__main__':
-    eventlet_utils.monkey_patch()
-    main()

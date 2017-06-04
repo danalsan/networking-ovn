@@ -1,17 +1,3 @@
-#            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
-#                    Version 2, December 2004
-#
-# Copyright (C) 2017 Red Hat, Inc.
-#
-# Everyone is permitted to copy and distribute verbatim or modified
-# copies of this license document, and changing it is allowed as long
-# as the name is changed.
-#
-#            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
-#   TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
-#
-#  0. You just DO WHAT THE FUCK YOU WANT TO.
-
 # Copyright 2017 Red Hat, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,23 +13,23 @@
 # limitations under the License.
 
 import collections
-import eventlet
 import re
+import six
 
 from neutron.agent.common import ovs_lib
-from neutron.agent.common import utils
 from neutron.agent.linux import external_process
 from neutron.agent.linux import ip_lib
 from neutron_lib import constants as n_const
+from oslo_concurrency import lockutils
 from oslo_log import log
 from ovs.stream import Stream
 from ovsdbapp.backend.ovs_idl import connection
 from ovsdbapp.backend.ovs_idl import idlutils
 
+from networking_ovn.agent.metadata import driver as metadata_driver
+from networking_ovn.agent.metadata import server as metadata_server
 from networking_ovn.common import config
 from networking_ovn.common import constants as ovn_const
-from networking_ovn.agent.metadata import driver as metadata_driver
-from networking_ovn.agent.metadata import server
 from networking_ovn.ovsdb import impl_idl_ovn as idl_ovn
 from networking_ovn.ovsdb import ovsdb_monitor
 from networking_ovn.ovsdb import row_event
@@ -51,6 +37,8 @@ from networking_ovn.ovsdb import vlog
 
 
 LOG = log.getLogger(__name__)
+_SYNC_STATE_LOCK = lockutils.ReaderWriterLock()
+
 
 NS_PREFIX = 'qmeta-'
 METADATA_DEFAULT_PREFIX = 16
@@ -63,53 +51,86 @@ MAC_PATTERN = re.compile(r'([0-9A-F]{2}[:-]){5}([0-9A-F]{2})', re.I)
 MetadataPortInfo = collections.namedtuple('MetadataPortInfo', ['mac',
                                                                'ip_addresses'])
 
-class OvnNbIdl(ovsdb_monitor.OvnIdl):
-    def __init__(self, driver, remote, schema):
-        super(OvnNbIdl, self).__init__(driver, remote, schema)
-        self.event_lock_name = "networking_ovn_metadata_agent"
+def _sync_lock(f):
+    """Decorator to block all operations for a global sync call."""
+    @six.wraps(f)
+    def wrapped(*args, **kwargs):
+        with _SYNC_STATE_LOCK.write_lock():
+            return f(*args, **kwargs)
+    return wrapped
 
-    @classmethod
-    def from_server(cls, connection_string, schema_name, driver):
-        _check_and_set_ssl_files(schema_name)
-        helper = idlutils.get_schema_helper(connection_string, schema_name)
-        helper.register_all()
-        _idl = cls(driver, connection_string, helper)
-        _idl.set_lock(_idl.event_lock_name)
-        return _idl
+
+def _wait_if_syncing(f):
+    """Decorator to wait if any sync operations are in progress."""
+    @six.wraps(f)
+    def wrapped(*args, **kwargs):
+        with _SYNC_STATE_LOCK.read_lock():
+            return f(*args, **kwargs)
+    return wrapped
 
 
 class OvnSbIdl(ovsdb_monitor.OvnIdl):
-    def __init__(self, remote, schema, chassis):
+    def __init__(self, remote, schema, events):
         super(OvnSbIdl, self).__init__(None, remote, schema)
-        self._pb_update_event = PortBindingChassisEvent(chassis)
-        self.notify_handler.watch_events([self._pb_update_event])
+        self.notify_handler.watch_events(events)
         self.event_lock_name = "networking_ovn_metadata_agent"
 
     @classmethod
-    def from_server(cls, connection_string, schema_name, chassis):
+    def from_server(cls, connection_string, schema_name, events):
         _check_and_set_ssl_files(schema_name)
         helper = idlutils.get_schema_helper(connection_string, schema_name)
         helper.register_all()
-        _idl = cls(connection_string, helper, chassis)
+        _idl = cls(connection_string, helper, events)
         _idl.set_lock(_idl.event_lock_name)
         return _idl
 
 
 class PortBindingChassisEvent(row_event.RowEvent):
-    def __init__(self, chassis):
-        self.chassis = chassis
+    def __init__(self, metadata_agent):
+        self.agent = metadata_agent
         table = 'Port_Binding'
         events = (self.ROW_UPDATE)
         super(PortBindingChassisEvent, self).__init__(
             events, table, None)
         self.event_name = 'PortBindingChassisEvent'
 
+    @_wait_if_syncing
     def run(self, event, row, old):
-        if len(row.chassis) and row.chassis[0].name == self.chassis:
-            print("Port bound to our chassis")
-        elif len(old.chassis) and old.chassis[0].name == self.chassis:
-            print("Port unbound to our chassis")
-        print len(row.chassis)
+        # Check if the port has been bound/unbound to our chassis and update
+        # the metadata namespace accordingly.
+        if len(row.chassis) and row.chassis[0].name == self.agent.chassis:
+            LOG.info("Port %s in datapath %s bound to our chassis",
+                     row.logical_port, str(row.datapath.uuid))
+            self.agent.update_datapath(str(row.datapath.uuid))
+        elif len(old.chassis) and old.chassis[0].name == self.agent.chassis:
+            LOG.info("Port %s in datapath %s unbound from our chassis",
+                     row.logical_port, str(row.datapath.uuid))
+            self.agent.update_datapath(str(row.datapath.uuid))
+
+
+class ChassisCreateEvent(row_event.RowEvent):
+    """Row create event - Chassis name == our_chassis.
+
+    On connection, we get a dump of all chassis so if we catch a creation
+    of our own chassis it has to be a reconnection. In this case, we need
+    to do a full sync to make sure that we capture all changes while the
+    connection to OVSDB was down.
+    """
+    def __init__(self, metadata_agent):
+        self.agent = metadata_agent
+        self.first_time = True
+        table = 'Chassis'
+        events = (self.ROW_CREATE)
+        super(ChassisCreateEvent, self).__init__(
+            events, table, (('name', '=', self.agent.chassis),))
+        self.event_name = 'ChassisCreateEvent'
+
+    def run(self, event, row, old):
+        if self.first_time:
+            self.first_time = False
+        else:
+            LOG.info("Connection to OVSDB established, doing a full sync")
+            self.agent.sync()
 
 
 def _check_and_set_ssl_files(schema_name):
@@ -141,6 +162,7 @@ def _get_own_chassis_name():
     ext_ids = ovs_lib.BaseOVS().db_get_val('Open_vSwitch', '.', 'external_ids')
     return ext_ids['system-id']
 
+
 class MetadataAgent(object):
 
     def __init__(self, conf):
@@ -154,7 +176,9 @@ class MetadataAgent(object):
 
         self.chassis = _get_own_chassis_name()
         idl_sb = OvnSbIdl.from_server(config.get_ovn_sb_connection(),
-                                      'OVN_Southbound', self.chassis)
+                                      'OVN_Southbound',
+                                      [PortBindingChassisEvent(self),
+                                       ChassisCreateEvent(self)])
         self.idl_sb_conn = connection.Connection(
             idl_sb, timeout=config.get_ovn_ovsdb_timeout())
 
@@ -162,126 +186,217 @@ class MetadataAgent(object):
         self.idl_sb_conn.start()
         self.sb_idl = idl_ovn.OvsdbSbOvnIdl(self.idl_sb_conn)
 
-        self.ensure_all_networks_provisioned()
+        self.sync()
 
         # Launch the server that will act as a proxy between the VM's and Nova.
-        proxy = server.UnixDomainMetadataProxy(self.conf, self.sb_idl)
+        proxy = metadata_server.UnixDomainMetadataProxy(self.conf, self.sb_idl)
         proxy.run()
 
-    def sync():
-        pass
+    @_sync_lock
+    def sync(self):
+        """Agent sync.
+
+        This function will make sure that all networks with ports in our
+        chassis are serving metadata. Also, it will tear down those namespaces
+        which were serving metadata but are not longer needed.
+        """
+        metadata_namespaces = self.ensure_all_networks_provisioned()
+        system_namespaces = ip_lib.IPWrapper().get_namespaces()
+        unused_namespaces = [ns for ns in system_namespaces if
+                             ns.startswith(NS_PREFIX) and
+                             ns not in metadata_namespaces]
+        for ns in unused_namespaces:
+            LOG.info("Cleaning up %s namespace which is not needed anymore",
+                     ns)
+            self.teardown_datapath(self._get_datapath_name(ns))
 
     @staticmethod
     def _get_veth_name(datapath):
         return ['{}{}{}'.format(n_const.TAP_DEVICE_PREFIX,
-                                 datapath[:10], i) for i in [0, 1]]
+                                datapath[:10], i) for i in [0, 1]]
+
+    @staticmethod
+    def _get_datapath_name(namespace):
+        return namespace[len(NS_PREFIX):]
+
+    @staticmethod
+    def _get_namespace_name(datapath):
+        return NS_PREFIX + datapath
+
+    def teardown_datapath(self, datapath):
+        """Unprovision this datapath to stop serving metadata.
+
+        This function will shutdown metadata proxy if it's running and delete
+        the VETH pair, the OVS port and the namespace.
+        """
+        self.update_chassis_metadata_networks(datapath, remove=True)
+        namespace = self._get_namespace_name(datapath)
+        ip = ip_lib.IPWrapper(namespace)
+        # If the namespace doesn't exist, return
+        if not ip.netns.exists(namespace):
+            return
+
+        metadata_driver.MetadataDriver.destroy_monitored_metadata_proxy(
+            self._process_monitor, datapath, self.conf, namespace)
+
+        veth_name = self._get_veth_name(datapath)
+        if ip_lib.device_exists(veth_name[0]):
+            ip_lib.IPWrapper().del_veth(veth_name[0])
+
+        ovs_br = ovs_lib.OVSBridge('br-int')
+        if ovs_br.port_exists(veth_name[0]):
+            ovs_br.delete_port(veth_name[0])
+
+        ip.garbage_collect_namespace()
+
+    def update_datapath(self, datapath):
+        """Update the metadata service for this datapath.
+
+        This function will:
+        * Provision the namespace if it wasn't already in place.
+        * Update the namespace if it was already serving metadata (for example,
+          after binding/unbinding the first/last port of a subnet in our
+          chassis).
+        * Tear down the namespace if there are no more ports in our chassis
+          for this datapath.
+        """
+        ports = self.sb_idl.get_ports_on_chassis(self.chassis)
+        datapath_ports = [p for p in ports if p.type == '' and
+                          str(p.datapath.uuid) == datapath]
+        if datapath_ports:
+            self.provision_datapath(datapath)
+        else:
+            self.teardown_datapath(datapath)
+
+    def provision_datapath(self, datapath):
+        """Provision the datapath so that it can serve metadata.
+
+        This function will create the namespace and VETH pair if needed
+        and assign the IP addresses to the interface corresponding to the
+        metadata port of the network. It will also remove existing IP
+        addresses that are no longer needed.
+
+        :return: The metadata namespace for this datapath
+        """
+        LOG.debug("Provisioning datapath %s", datapath)
+        port = self.sb_idl.get_metadata_port_network(datapath)
+        # If there's no metadata port or it doesn't have a MAC or IP
+        # addresses, then tear the namespace down if needed. This might happen
+        # when there are no subnets yet created so metadata port doesn't have
+        # an IP address.
+        if not (port and port.mac and
+                port.external_ids.get(ovn_const.OVN_CIDRS_EXT_ID_KEY, None)):
+            LOG.debug("There is no metadata port for datapath %s or it has no "
+                      "MAC or IP addresses configured, tearing the namespace "
+                      "down if needed", datapath)
+            self.teardown_datapath(datapath)
+            return
+
+        # First entry of the mac field must be the MAC address.
+        match = MAC_PATTERN.match(port.mac[0].split(' ')[0])
+        # If it is not, we can't provision the namespace. Tear it down if
+        # needed and log the error.
+        if not match:
+            LOG.error("Metadata port for datapath %s doesn't have a MAC "
+                      "address, tearing the namespace down if needed",
+                      datapath)
+            self.teardown_datapath(datapath)
+            return
+
+        mac = match.group()
+        ip_addresses = set(
+            port.external_ids[ovn_const.OVN_CIDRS_EXT_ID_KEY].split(' '))
+        ip_addresses.add(METADATA_DEFAULT_CIDR)
+        metadata_port = MetadataPortInfo(mac, ip_addresses)
+
+        # Create the VETH pair if it's not created. Also the add_veth function
+        # will create the namespace for us.
+        namespace = self._get_namespace_name(datapath)
+        veth_name = self._get_veth_name(datapath)
+
+        ip1 = ip_lib.IPDevice(veth_name[0])
+        if ip_lib.device_exists(veth_name[1], namespace):
+            ip2 = ip_lib.IPDevice(veth_name[1], namespace)
+        else:
+            LOG.debug("Creating VETH %s in %s namespace", veth_name[1],
+                      namespace)
+            # Might happen that the end in the root namespace exists even
+            # though the other end doesn't. Make sure we delete it first if
+            # that's the case.
+            if ip1.exists():
+                ip1.link.delete()
+            ip1, ip2 = ip_lib.IPWrapper().add_veth(
+                veth_name[0], veth_name[1], namespace)
+
+        # Make sure both ends of the VETH are up
+        ip1.link.set_up()
+        ip2.link.set_up()
+
+        # Configure the MAC address.
+        ip2.link.set_address(metadata_port.mac)
+        dev_info = ip2.addr.list()
+
+        # Configure the IP addresses on the VETH pair and remove those
+        # that we no longer need.
+        current_cidrs = {dev['cidr'] for dev in dev_info}
+        for ipaddr in current_cidrs - metadata_port.ip_addresses:
+            ip2.addr.delete(ipaddr)
+        for ipaddr in metadata_port.ip_addresses - current_cidrs:
+            ip2.addr.add(ipaddr)
+
+        # Configure the OVS port and add external_ids:iface-id so that it
+        # can be tracked by OVN.
+        ovs_br = ovs_lib.OVSBridge('br-int')
+        ovs_br.add_port(veth_name[0])
+        ovs_br.set_db_attribute('Interface', veth_name[0], 'external_ids',
+                                {'iface-id': port.logical_port})
+
+        # Spawn metadata proxy if it's not already running.
+        metadata_driver.MetadataDriver.spawn_monitored_metadata_proxy(
+            self._process_monitor, namespace, METADATA_PORT,
+            self.conf, network_id=datapath)
+
+        self.update_chassis_metadata_networks(datapath)
+        return namespace
 
     def ensure_all_networks_provisioned(self):
-        # 1. Retrieve all datapaths where we have ports bound in our chassis
-        # 2. For every datapath make sure that:
-        #   2.1 The namespace is created
-        #   2.2 The VETH pair is created
-        #   2.3 An OVS port exists with the right external-id:iface-id
-        #   2.4 metadata proxy is running
-        #   2.5 It's added to the Chassis column externa-id
+        """Ensure that all datapaths are provisioned.
 
-        # 1. Retrieve all ports in our Chassis with type == ''
+        This function will make sure that all datapaths with ports bound to
+        our chassis have its namespace, VETH pair and OVS port created and
+        metadata proxy is up and running.
+
+        :return: A list with the namespaces that are currently serving
+        metadata
+        """
+        # Retrieve all ports in our Chassis with type == ''
         ports = self.sb_idl.get_ports_on_chassis(self.chassis)
         datapaths = {str(p.datapath.uuid) for p in ports if p.type == ''}
+        namespaces = []
+        # Make sure that all those datapaths are serving metadata
         for datapath in datapaths:
-            port = self.sb_idl.get_metadata_port_network(datapath)
-            # If there's no metadata port, it has no MAC address or no IP's,
-            # then skip this datapath.
-            # TODO(dalvarez): Tear down the namespace if exists when skipping
-            # a datapath.
-            if not (port and port.mac and
-                    port.external_ids.get(ovn_const.OVN_CIDRS_EXT_ID_KEY,
-                                          None)):
-                continue
+            netns = self.provision_datapath(datapath)
+            if netns:
+                namespaces.append(netns)
 
-            # First entry of the mac field must be the MAC address
-            match = MAC_PATTERN.match(port.mac[0].split(' ')[0])
-            if not match:
-                continue
+        return namespaces
 
-            mac = match.group()
-            ip_addresses = set(
-                port.external_ids[ovn_const.OVN_CIDRS_EXT_ID_KEY].split(' '))
-            ip_addresses.add(METADATA_DEFAULT_CIDR)
-            metadata_port = MetadataPortInfo(mac, ip_addresses)
-
-            # 2.1 Make sure that the namespace is created
-            # 2.2 Make sure that the VETH pair exists
-            namespace = NS_PREFIX + datapath
-            #ip_lib.IPWrapper().ensure_namespace(namespace)
-            veth_name = self._get_veth_name(datapath)
-
-            if ip_lib.device_exists(veth_name[1], namespace):
-                ip2 = ip_lib.IPDevice(veth_name[1], namespace)
-            else:
-                ip1, ip2 = ip_lib.IPWrapper().add_veth(
-                    veth_name[0], veth_name[1], namespace)
-                ip1.link.set_up()
-                ip2.link.set_up()
-
-            # Configure the MAC and IP addresses
-            ip2.link.set_address(metadata_port.mac)
-            dev_info = ip2.addr.list()
-
-            # Configure the IP addresses on the VETH pair and remove those
-            # that we no longer need.
-            current_cidrs = {dev['cidr'] for dev in dev_info}
-            for ipaddr in current_cidrs - metadata_port.ip_addresses:
-                ip2.addr.delete(ipaddr)
-            for ipaddr in metadata_port.ip_addresses - current_cidrs:
-                ip2.addr.add(ipaddr)
-
-            # Configure the OVS port and add external_ids:iface-id so that it
-            # can be tracked by OVN.
-            # TODO(dalvarez): pick integration bridge name from conf
-            ovs_br = ovs_lib.OVSBridge('br-int')
-            ovs_br.add_port(veth_name[0])
-            ovs_br.set_db_attribute('Interface', veth_name[0], 'external_ids',
-                                    {'iface-id': port.logical_port})
-
-            # Spawn metadata proxy
-            metadata_driver.MetadataDriver.spawn_monitored_metadata_proxy(
-                self._process_monitor, namespace, METADATA_PORT,
-                self.conf, network_id=str(port.datapath.uuid))
-
-        #ip1.link.set_address(
+    def update_chassis_metadata_networks(self, datapath, remove=False):
+        """Add or remove a datapath from the list of current datapaths that
+        we're currently serving metadata.
+        """
         current_dps = self.sb_idl.get_chassis_metadata_networks(self.chassis)
-        #with self._nb_ovn.transaction(check_error=True) as txn:
-        if datapaths != current_dps:
+        updated = False
+        if remove:
+            if datapath in current_dps:
+                current_dps.remove(datapath)
+                updated = True
+        else:
+            if datapath not in current_dps:
+                current_dps.append(datapath)
+                updated = True
+
+        if updated:
             with self.sb_idl.transaction(check_error=True) as txn:
                 txn.add(self.sb_idl.set_chassis_metadata_networks(
-                    self.chassis, datapaths))
-        #  datapaths - set(current_dps)
-        print current_dps
-        print datapaths
-
-
-if __name__ == '__mainX__':
-
-    idl_nb = OvnNbIdl.from_server('tcp:127.0.0.1:6641', 'OVN_Northbound', None)
-    idl_nb_conn = connection.Connection(idl_nb, timeout=180)
-    idl_nb_conn.start()
-
-    ovs = ovs_lib.BaseOVS()
-    ovs.db_get_val('open', '.', 'external_ids', 'system-id')
-    cmd = 'ovs-vsctl get open . external_ids:system-id'
-    chassis = utils.execute(cmd.split(),
-                            run_as_root=True).strip().replace('"', '')
-
-    LOG.debug('chassis: %s', chassis)
-    idl_sb = OvnSbIdl.from_server('tcp:127.0.0.1:6642', 'OVN_Southbound',
-                                  chassis)
-    idl_sb_conn = connection.Connection(idl_sb, timeout=180)
-    idl_sb_conn.start()
-
-    nb_idl = idl_ovn.OvsdbNbOvnIdl(idl_nb_conn)
-    import pdb; pdb.set_trace()
-    nets = nb_idl.get_all_logical_switches_with_ports()
-
-    while True:
-        eventlet.sleep(0)
+                    self.chassis, current_dps))
