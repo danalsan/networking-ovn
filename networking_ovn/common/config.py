@@ -119,7 +119,10 @@ ovn_opts = [
     cfg.IntOpt('dhcp_default_lease_time',
                default=(12 * 60 * 60),
                help=_('Default least time (in seconds) to use with '
-                      'OVN\'s native DHCP service.'))
+                      'OVN\'s native DHCP service.')),
+    cfg.BoolOpt('ovn_metadata_enabled',
+                default=True,
+                help=_('Whether to use metadata service.'))
 ]
 
 cfg.CONF.register_opts(ovn_opts, group='ovn')
@@ -189,3 +192,7 @@ def get_ovn_vhost_sock_dir():
 
 def get_ovn_dhcp_default_lease_time():
     return cfg.CONF.ovn.dhcp_default_lease_time
+
+
+def is_ovn_metadata_enabled():
+    return cfg.CONF.ovn.ovn_metadata_enabled

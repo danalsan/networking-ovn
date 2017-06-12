@@ -30,10 +30,12 @@ from oslo_db import exception as os_db_exc
 from oslo_log import log
 
 from neutron.db import provisioning_blocks
+from neutron.plugins.common import utils as p_utils
 from neutron.services.qos import qos_consts
 from neutron.services.segments import db as segment_service_db
 
 from networking_ovn._i18n import _
+from networking_ovn.agent.metadata import agent as metadata_agent
 from networking_ovn.common import acl as ovn_acl
 from networking_ovn.common import config
 from networking_ovn.common import constants as ovn_const
@@ -276,6 +278,15 @@ class OVNMechanismDriver(api.MechanismDriver):
         segid = self._get_attribute(network, pnet.SEGMENTATION_ID)
         self.create_network_in_ovn(network, {}, physnet, segid)
 
+        if config.is_ovn_metadata_enabled():
+            # Create a neutron port for DHCP/metadata services
+            port = {'port':
+                    {'network_id': network['id'],
+                     'tenant_id': '',
+                     'device_owner': const.DEVICE_OWNER_DHCP}}
+            p_utils.create_port(self._plugin, n_context.get_admin_context(),
+                                port)
+
     def create_network_in_ovn(self, network, ext_ids,
                               physnet=None, segid=None):
         # Create a logical switch with a name equal to the Neutron network
@@ -357,36 +368,103 @@ class OVNMechanismDriver(api.MechanismDriver):
             utils.ovn_name(network['id']), if_exists=True).execute(
                 check_error=True)
 
+    def _find_metadata_port(self, context, network_id):
+        ports = self._plugin.get_ports(
+            context._plugin_context, filters=dict(
+                network_id=[network_id], device_owner=['network:dhcp']))
+        # There should be only one metadata port per network
+        if len(ports) == 1:
+            return ports[0]
+
+    def update_metadata_port(self, context, network_id):
+        """Update metadata port.
+
+        This function will allocate an IP address for the metadata port of
+        the given network in all its IPv4 subnets.
+        """
+        # Retrieve the metadata port of this network
+        metadata_port = self._find_metadata_port(context, network_id)
+        if not metadata_port:
+            return
+
+        # Retrieve all subnets in this network
+        subnets = self._plugin.get_subnets(
+            context._plugin_context, filters=dict(
+                network_id=[network_id], ip_version=[4]))
+
+        subnet_ids = set(s['id'] for s in subnets)
+        port_subnet_ids = set(ip['subnet_id'] for ip in
+                              metadata_port['fixed_ips'])
+
+        # Find all subnets where metadata port doesn't have an IP in and
+        # allocate one.
+        if subnet_ids != port_subnet_ids:
+            wanted_fixed_ips = []
+            for fixed_ip in metadata_port['fixed_ips']:
+                wanted_fixed_ips.append(
+                    {'subnet_id': fixed_ip['subnet_id'],
+                     'ip_address': fixed_ip['ip_address']})
+            wanted_fixed_ips.extend(
+                dict(subnet_id=s)
+                for s in subnet_ids - port_subnet_ids)
+
+            port = {'id': metadata_port['id'],
+                    'port': {'network_id': network_id,
+                             'fixed_ips': wanted_fixed_ips}}
+            self._plugin.update_port(n_context.get_admin_context(),
+                                     metadata_port['id'], port)
+
+    def _find_metadata_port_ip(self, context, subnet):
+        metadata_port = self._find_metadata_port(context, subnet['network_id'])
+        if metadata_port:
+            for fixed_ip in metadata_port['fixed_ips']:
+                if fixed_ip['subnet_id'] == subnet['id']:
+                    return fixed_ip['ip_address']
+
     def create_subnet_postcommit(self, context):
         subnet = context.current
+        network = context.network.current
+        if subnet['ip_version'] == 4:
+            self.update_metadata_port(context, network['id'])
         if subnet['enable_dhcp']:
-            self.add_subnet_dhcp_options_in_ovn(subnet,
-                                                context.network.current)
+            metadata_port_ip = self._find_metadata_port_ip(context, subnet)
+            self.add_subnet_dhcp_options_in_ovn(
+                subnet, network, metadata_port_ip=metadata_port_ip)
 
     def update_subnet_postcommit(self, context):
         subnet = context.current
         original_subnet = context.original
         network = context.network.current
+
+        if subnet['ip_version'] == 4 or original_subnet['ip_version'] == 4:
+            self.update_metadata_port(context, network['id'])
+
         if not subnet['enable_dhcp'] and not original_subnet['enable_dhcp']:
             return
+
+        metadata_port_ip = self._find_metadata_port_ip(context, subnet)
         if not original_subnet['enable_dhcp']:
-            self.enable_subnet_dhcp_options_in_ovn(subnet, network)
+            self.enable_subnet_dhcp_options_in_ovn(
+                subnet, network, metadata_port_ip=metadata_port_ip)
         elif not subnet['enable_dhcp']:
             self.remove_subnet_dhcp_options_in_ovn(subnet)
         else:
-            self.update_subnet_dhcp_options_in_ovn(subnet, network)
+            self.update_subnet_dhcp_options_in_ovn(
+                subnet, network, metadata_port_ip=metadata_port_ip)
 
     def delete_subnet_postcommit(self, context):
         subnet = context.current
         self.remove_subnet_dhcp_options_in_ovn(subnet)
 
     def add_subnet_dhcp_options_in_ovn(self, subnet, network,
-                                       ovn_dhcp_options=None):
+                                       ovn_dhcp_options=None,
+                                       metadata_port_ip=None):
         if utils.is_dhcp_options_ignored(subnet):
             return
 
         if not ovn_dhcp_options:
-            ovn_dhcp_options = self.get_ovn_dhcp_options(subnet, network)
+            ovn_dhcp_options = self.get_ovn_dhcp_options(
+                subnet, network, metadata_port_ip=metadata_port_ip)
 
         with self._nb_ovn.transaction(check_error=True) as txn:
             txn.add(self._nb_ovn.add_dhcp_options(
@@ -401,7 +479,8 @@ class OVNMechanismDriver(api.MechanismDriver):
             for dhcp_option in dhcp_options:
                 txn.add(self._nb_ovn.delete_dhcp_options(dhcp_option['uuid']))
 
-    def enable_subnet_dhcp_options_in_ovn(self, subnet, network):
+    def enable_subnet_dhcp_options_in_ovn(self, subnet, network,
+                                          metadata_port_ip=None):
         if utils.is_dhcp_options_ignored(subnet):
             return
 
@@ -411,7 +490,8 @@ class OVNMechanismDriver(api.MechanismDriver):
         ports = [p for p in all_ports if not p['device_owner'].startswith(
             const.DEVICE_OWNER_PREFIXES)]
 
-        subnet_dhcp_options = self.get_ovn_dhcp_options(subnet, network)
+        subnet_dhcp_options = self.get_ovn_dhcp_options(
+            subnet, network, metadata_port_ip=metadata_port_ip)
         subnet_dhcp_cmd = self._nb_ovn.add_dhcp_options(subnet['id'],
                                                         **subnet_dhcp_options)
         with self._nb_ovn.transaction(check_error=True) as txn:
@@ -442,7 +522,8 @@ class OVNMechanismDriver(api.MechanismDriver):
                         lport_name=port['id'],
                         **columns))
 
-    def update_subnet_dhcp_options_in_ovn(self, subnet, network):
+    def update_subnet_dhcp_options_in_ovn(self, subnet, network,
+                                          metadata_port_ip=None):
         if utils.is_dhcp_options_ignored(subnet):
             return
         original_options = self._nb_ovn.get_subnet_dhcp_options(subnet['id'])
@@ -452,7 +533,8 @@ class OVNMechanismDriver(api.MechanismDriver):
                 mac = original_options['options'].get('server_id')
             else:
                 mac = original_options['options'].get('server_mac')
-        new_options = self.get_ovn_dhcp_options(subnet, network, mac)
+        new_options = self.get_ovn_dhcp_options(
+            subnet, network, mac, metadata_port_ip=metadata_port_ip)
         # Check whether DHCP changed
         if (original_options and
                 original_options['cidr'] == new_options['cidr'] and
@@ -465,7 +547,8 @@ class OVNMechanismDriver(api.MechanismDriver):
             for cmd in txn_commands:
                 txn.add(cmd)
 
-    def get_ovn_dhcp_options(self, subnet, network, server_mac=None):
+    def get_ovn_dhcp_options(self, subnet, network, server_mac=None,
+                             metadata_port_ip=None):
         external_ids = {'subnet_id': subnet['id']}
         dhcp_options = {'cidr': subnet['cidr'], 'options': {},
                         'external_ids': external_ids}
@@ -473,14 +556,16 @@ class OVNMechanismDriver(api.MechanismDriver):
         if subnet['enable_dhcp']:
             if subnet['ip_version'] == const.IP_VERSION_4:
                 dhcp_options['options'] = self._get_ovn_dhcpv4_opts(
-                    subnet, network, server_mac=server_mac)
+                    subnet, network, server_mac=server_mac,
+                    metadata_port_ip=metadata_port_ip)
             else:
                 dhcp_options['options'] = self._get_ovn_dhcpv6_opts(
                     subnet, server_id=server_mac)
 
         return dhcp_options
 
-    def _get_ovn_dhcpv4_opts(self, subnet, network, server_mac=None):
+    def _get_ovn_dhcpv4_opts(self, subnet, network, server_mac=None,
+                             metadata_port_ip=None):
         if not subnet['gateway_ip']:
             return {}
 
@@ -506,6 +591,10 @@ class OVNMechanismDriver(api.MechanismDriver):
         # If subnet hostroutes are defined, add them in the
         # 'classless_static_route' dhcp option
         classless_static_routes = "{"
+        if metadata_port_ip:
+            classless_static_routes += ("%s/32,%s, ") % (
+                metadata_agent.METADATA_DEFAULT_IP, metadata_port_ip)
+
         for route in subnet['host_routes']:
             classless_static_routes += ("%s,%s, ") % (
                 route['destination'], route['nexthop'])

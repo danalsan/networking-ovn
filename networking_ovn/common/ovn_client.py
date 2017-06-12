@@ -39,7 +39,8 @@ OvnPortInfo = collections.namedtuple('OvnPortInfo', ['type', 'options',
                                                      'port_security',
                                                      'parent_name', 'tag',
                                                      'dhcpv4_options',
-                                                     'dhcpv6_options'])
+                                                     'dhcpv6_options',
+                                                     'cidrs'])
 
 
 class OVNClient(object):
@@ -163,6 +164,7 @@ class OVNClient(object):
             qos_options = self._qos_driver.get_qos_options(port)
         vtep_physical_switch = binding_prof.get('vtep-physical-switch')
 
+        cidrs = ''
         if vtep_physical_switch:
             vtep_logical_switch = binding_prof.get('vtep-logical-switch')
             port_type = 'vtep'
@@ -179,18 +181,27 @@ class OVNClient(object):
             addresses = port['mac_address']
             for ip in port.get('fixed_ips', []):
                 addresses += ' ' + ip['ip_address']
+                subnet = self._plugin.get_subnet(n_context.get_admin_context(),
+                                                 ip['subnet_id'])
+                cidrs += ' {}/{}'.format(ip['ip_address'],
+                                         subnet['cidr'].split('/')[1])
             port_security = self._get_allowed_addresses_from_port(port)
-            port_type = ''
+            port_type = ovn_const.OVN_NEUTRON_OWNER_TO_PORT_TYPE.get(
+                port['device_owner'], '')
 
         dhcpv4_options = self._get_port_dhcp_options(port, const.IP_VERSION_4)
         dhcpv6_options = self._get_port_dhcp_options(port, const.IP_VERSION_6)
 
         return OvnPortInfo(port_type, options, [addresses], port_security,
-                           parent_name, tag, dhcpv4_options, dhcpv6_options)
+                           parent_name, tag, dhcpv4_options, dhcpv6_options,
+                           cidrs.strip())
 
     def create_port(self, port):
         port_info = self._get_port_options(port)
-        external_ids = {ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name']}
+        external_ids = {ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name'],
+                        ovn_const.OVN_DEVID_EXT_ID_KEY: port['device_id'],
+                        ovn_const.OVN_PROJID_EXT_ID_KEY: port['project_id'],
+                        ovn_const.OVN_CIDRS_EXT_ID_KEY: port_info.cidrs}
         lswitch_name = utils.ovn_name(port['network_id'])
         admin_context = n_context.get_admin_context()
         sg_cache = {}
@@ -258,8 +269,10 @@ class OVNClient(object):
 
     def update_port(self, port, original_port, qos_options=None):
         port_info = self._get_port_options(port, qos_options)
-        external_ids = {
-            ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name']}
+        external_ids = {ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name'],
+                        ovn_const.OVN_DEVID_EXT_ID_KEY: port['device_id'],
+                        ovn_const.OVN_PROJID_EXT_ID_KEY: port['project_id'],
+                        ovn_const.OVN_CIDRS_EXT_ID_KEY: port_info.cidrs}
         admin_context = n_context.get_admin_context()
         sg_cache = {}
         subnet_cache = {}
